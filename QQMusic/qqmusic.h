@@ -138,6 +138,7 @@ private:
     QTemporaryDir ncmTempDir;
     QProgressDialog *ncmProgress;
     QString ncmOutputDir;
+    QMap<QString, QString> ncmLyricsByBase;
     bool ncmConversionCancelled;
     void refreshCurrentCover(bool preferEmbeddedCover);
 };

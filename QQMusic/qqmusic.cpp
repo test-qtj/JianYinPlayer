@@ -977,6 +977,26 @@ void QQMusic::startNcmConversion(const QStringList &inputPaths)
         settings.setValue(QStringLiteral("ncm2mp3/jarPath"), jarPath);
     }
 
+    ncmLyricsByBase.clear();
+    const auto rememberSidecar = [this](const QString &ncmPath) {
+        const QFileInfo ncmInfo(ncmPath);
+        const QString lrcPath = ncmInfo.dir().filePath(ncmInfo.completeBaseName() + QStringLiteral(".lrc"));
+        if (QFileInfo(lrcPath).isFile())
+            ncmLyricsByBase.insert(ncmInfo.completeBaseName().toCaseFolded(), lrcPath);
+    };
+    for (const QString &inputPath : inputPaths) {
+        const QFileInfo inputInfo(inputPath);
+        if (inputInfo.isDir()) {
+            QDirIterator iterator(inputPath, QStringList() << QStringLiteral("*.ncm")
+                                                          << QStringLiteral("*.NCM"),
+                                 QDir::Files, QDirIterator::Subdirectories);
+            while (iterator.hasNext()) rememberSidecar(iterator.next());
+        } else if (inputInfo.isFile()
+                   && inputInfo.suffix().compare(QStringLiteral("ncm"), Qt::CaseInsensitive) == 0) {
+            rememberSidecar(inputInfo.absoluteFilePath());
+        }
+    }
+
     if (!ncmTempDir.isValid()) {
         QMessageBox::warning(this, QStringLiteral("无法开始转换"),
                              QStringLiteral("无法创建临时转换目录，请检查系统临时目录的可用空间和权限。"));
@@ -1078,6 +1098,7 @@ void QQMusic::finishNcmConversion(int exitCode, QProcess::ExitStatus exitStatus)
     const QString libraryDir = QDir(musicRoot).filePath(QStringLiteral("简音播放器/转换音乐"));
     QStringList importedPaths;
     int copyFailures = 0;
+    int lyricCopyFailures = 0;
     if (!QDir().mkpath(libraryDir)) {
         if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
         ncmOutputDir.clear();
@@ -1091,12 +1112,21 @@ void QQMusic::finishNcmConversion(int exitCode, QProcess::ExitStatus exitStatus)
             const QString sourcePath = iterator.next();
             const QFileInfo sourceInfo(sourcePath);
             const QString destinationPath = nextAvailableAudioPath(libraryDir, sourceInfo);
-            if (QFile::copy(sourcePath, destinationPath))
+            if (QFile::copy(sourcePath, destinationPath)) {
                 importedPaths.append(destinationPath);
-            else
+                const QString lyricSource = ncmLyricsByBase.value(sourceInfo.completeBaseName().toCaseFolded());
+                if (!lyricSource.isEmpty()) {
+                    const QString lyricName = QFileInfo(destinationPath).completeBaseName() + QStringLiteral(".lrc");
+                    const QString lyricDestination = QDir(libraryDir).filePath(lyricName);
+                    if (!QFileInfo::exists(lyricDestination) && !QFile::copy(lyricSource, lyricDestination))
+                        ++lyricCopyFailures;
+                }
+            } else {
                 ++copyFailures;
+            }
         }
     }
+    ncmLyricsByBase.clear();
     if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
     ncmOutputDir.clear();
 
@@ -1122,6 +1152,8 @@ void QQMusic::finishNcmConversion(int exitCode, QProcess::ExitStatus exitStatus)
         summary += QStringLiteral("\n转换器报告 %1 个文件转换失败。").arg(conversionFailures);
     if (copyFailures > 0)
         summary += QStringLiteral("\n有 %1 个文件复制失败。请检查磁盘空间或目标目录权限。").arg(copyFailures);
+    if (lyricCopyFailures > 0)
+        summary += QStringLiteral("\n有 %1 个同名歌词文件未能复制。").arg(lyricCopyFailures);
     QMessageBox::information(this, QStringLiteral("NCM 导入完成"), summary);
 }
 

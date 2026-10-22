@@ -23,7 +23,7 @@ The repository contains source code and UI assets. It does not include a prebuil
 
 The NCM import option calls the separately installed [NCM2MP3](https://github.com/charlotte-xiao/NCM2MP3) command-line JAR. Java 8 or newer and the converter JAR are required; neither is bundled here. In the player, use the + button, choose 导入 NCM 音乐, then select files or scan a folder. The first use may ask you to locate the JAR.
 
-Converted audio is copied to Music/JianYinPlayer/转换音乐 and added to the local library. Original NCM files are left in place.
+Converted audio is copied to Music/JianYinPlayer/转换音乐 and added to the local library. Original NCM files are left in place. Same-name LRC lyric files beside the source NCM files are copied when present; the converter does not fetch lyrics.
 
 ## Repository layout
 
