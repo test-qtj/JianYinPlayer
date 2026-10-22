@@ -24,6 +24,11 @@
 #include <QCryptographicHash>
 #include <QTimer>
 #include <QImage>
+#include <QDirIterator>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QTemporaryDir>
+#include <QUuid>
 
 namespace {
 
@@ -212,6 +217,22 @@ QString createUntaggedMp3PlaybackCopy(const QString &sourcePath)
     return playbackCopy.error() == QFile::NoError ? playbackPath : QString();
 }
 
+QString nextAvailableAudioPath(const QString &directory, const QFileInfo &sourceInfo)
+{
+    const QString suffix = sourceInfo.suffix();
+    const QString stem = sourceInfo.completeBaseName();
+    QString candidate = QDir(directory).filePath(sourceInfo.fileName());
+    int copyNumber = 2;
+    while (QFileInfo::exists(candidate)) {
+        const QString fileName = suffix.isEmpty()
+                ? QStringLiteral("%1 (%2)").arg(stem).arg(copyNumber)
+                : QStringLiteral("%1 (%2).%3").arg(stem).arg(copyNumber).arg(suffix);
+        candidate = QDir(directory).filePath(fileName);
+        ++copyNumber;
+    }
+    return candidate;
+}
+
 } // namespace
 
 
@@ -224,6 +245,9 @@ QQMusic::QQMusic(QWidget *parent)
     , currentIndex(-1)
     , totalTime(0)
     , isDrag(false)
+    , ncmProcess(nullptr)
+    , ncmProgress(nullptr)
+    , ncmConversionCancelled(false)
 {
     ui->setupUi(this);
 
@@ -240,6 +264,10 @@ QQMusic::QQMusic(QWidget *parent)
 
 QQMusic::~QQMusic()
 {
+    if (ncmProcess && ncmProcess->state() != QProcess::NotRunning) {
+        ncmProcess->kill();
+        ncmProcess->waitForFinished(1500);
+    }
     if (sqlite.isOpen()) {
         musicList.writeToDB();
         sqlite.close();
@@ -298,6 +326,7 @@ void QQMusic::initUi()
     ui->playMode->setStyleSheet(chromeButtonStyle);
     ui->volume->setStyleSheet(chromeButtonStyle);
     ui->addLocal->setStyleSheet(chromeButtonStyle);
+    ui->addLocal->setToolTip(QStringLiteral("添加音乐或导入 NCM"));
     ui->lrcWord->setStyleSheet(chromeButtonStyle);
     ui->musicCover->setPixmap(QPixmap(QStringLiteral(":/images/rec/001.png")));
     ui->musicCover->setScaledContents(true);
@@ -807,6 +836,24 @@ void QQMusic::on_volume_clicked()
 
 void QQMusic::on_addLocal_clicked()
 {
+    QMenu menu(this);
+    QAction *addAudioAction = menu.addAction(QStringLiteral("添加本地音乐…"));
+    QMenu *ncmMenu = menu.addMenu(QStringLiteral("导入 NCM 音乐"));
+    QAction *ncmFilesAction = ncmMenu->addAction(QStringLiteral("选择 NCM 文件…"));
+    QAction *ncmFolderAction = ncmMenu->addAction(QStringLiteral("扫描 NCM 文件夹…"));
+    QAction *selectedAction = menu.exec(ui->addLocal->mapToGlobal(
+                                            QPoint(0, -menu.sizeHint().height())));
+    if (selectedAction == addAudioAction) {
+        addLocalAudioFiles();
+    } else if (selectedAction == ncmFilesAction) {
+        chooseNcmFiles();
+    } else if (selectedAction == ncmFolderAction) {
+        chooseNcmFolder();
+    }
+}
+
+void QQMusic::addLocalAudioFiles()
+{
     QFileDialog fileDialog(this);
 
     // 设置窗口的标题
@@ -849,6 +896,233 @@ void QQMusic::on_addLocal_clicked()
 
         ui->localPage->reFresh(musicList);
     }
+}
+
+void QQMusic::chooseNcmFiles()
+{
+    QFileDialog fileDialog(this);
+    fileDialog.setWindowTitle(QStringLiteral("选择网易云音乐 NCM 文件"));
+    fileDialog.setFileMode(QFileDialog::ExistingFiles);
+    fileDialog.setNameFilter(QStringLiteral("NCM 文件 (*.ncm *.NCM)"));
+    if (fileDialog.exec() != QDialog::Accepted) return;
+
+    QStringList inputPaths;
+    const QList<QUrl> urls = fileDialog.selectedUrls();
+    for (const QUrl &url : urls) {
+        if (url.isLocalFile()) inputPaths.append(url.toLocalFile());
+    }
+    startNcmConversion(inputPaths);
+}
+
+void QQMusic::chooseNcmFolder()
+{
+    const QString folder = QFileDialog::getExistingDirectory(
+                this, QStringLiteral("选择要批量导入的 NCM 文件夹"),
+                QStandardPaths::writableLocation(QStandardPaths::MusicLocation));
+    if (folder.isEmpty()) return;
+
+    QDirIterator iterator(folder, QStringList() << QStringLiteral("*.ncm")
+                                               << QStringLiteral("*.NCM"),
+                         QDir::Files, QDirIterator::Subdirectories);
+    int fileCount = 0;
+    while (iterator.hasNext()) {
+        iterator.next();
+        ++fileCount;
+    }
+    if (fileCount == 0) {
+        QMessageBox::information(this, QStringLiteral("没有找到 NCM 文件"),
+                                 QStringLiteral("所选文件夹及其子文件夹中没有 .ncm 文件。"));
+        return;
+    }
+    startNcmConversion(QStringList() << folder);
+}
+
+void QQMusic::startNcmConversion(const QStringList &inputPaths)
+{
+    if (inputPaths.isEmpty()) return;
+    if (ncmProcess && ncmProcess->state() != QProcess::NotRunning) {
+        QMessageBox::information(this, QStringLiteral("正在转换"),
+                                 QStringLiteral("当前批次转换完成后再开始下一批。"));
+        return;
+    }
+
+    const QString javaPath = QStandardPaths::findExecutable(QStringLiteral("java"));
+    if (javaPath.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("需要 Java 环境"),
+                             QStringLiteral("没有找到 Java。请安装 Java 8 或更高版本，并将 java 加入 PATH 后重试。"));
+        return;
+    }
+
+    QSettings settings(QStringLiteral("JianYinPlayer"), QStringLiteral("QQMusic"));
+    QString jarPath = settings.value(QStringLiteral("ncm2mp3/jarPath")).toString();
+    if (!QFileInfo(jarPath).isFile()) {
+        const QStringList candidates = QStringList()
+                << QDir(QCoreApplication::applicationDirPath()).filePath(
+                       QStringLiteral("tools/NCM2MP3-3.1.0-shaded.jar"))
+                << QStringLiteral("D:/NCM2MP3/target/NCM2MP3-3.1.0-shaded.jar")
+                << QStringLiteral("D:/NCM2MP3/target/NCM2MP3-3.1.0.jar");
+        for (const QString &candidate : candidates) {
+            if (QFileInfo(candidate).isFile()) {
+                jarPath = candidate;
+                break;
+            }
+        }
+    }
+    if (!QFileInfo(jarPath).isFile()) {
+        jarPath = QFileDialog::getOpenFileName(
+                    this, QStringLiteral("定位 NCM2MP3 工具"),
+                    QStringLiteral("D:/NCM2MP3/target"),
+                    QStringLiteral("Java 程序包 (*.jar)"));
+        if (jarPath.isEmpty()) return;
+        settings.setValue(QStringLiteral("ncm2mp3/jarPath"), jarPath);
+    }
+
+    if (!ncmTempDir.isValid()) {
+        QMessageBox::warning(this, QStringLiteral("无法开始转换"),
+                             QStringLiteral("无法创建临时转换目录，请检查系统临时目录的可用空间和权限。"));
+        return;
+    }
+    ncmOutputDir = QDir(ncmTempDir.path()).filePath(
+                QStringLiteral("batch-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces)));
+    if (!QDir().mkpath(ncmOutputDir)) {
+        QMessageBox::warning(this, QStringLiteral("无法开始转换"),
+                             QStringLiteral("无法创建临时转换目录。"));
+        ncmOutputDir.clear();
+        return;
+    }
+
+    QStringList arguments;
+    arguments << QStringLiteral("-jar") << jarPath << QStringLiteral("-c");
+    arguments.append(inputPaths);
+
+    ncmConversionCancelled = false;
+    ncmProcess = new QProcess(this);
+    ncmProcess->setWorkingDirectory(ncmOutputDir);
+    ncmProgress = new QProgressDialog(
+                QStringLiteral("正在转换 NCM 文件，请稍候…"), QStringLiteral("取消"), 0, 0, this);
+    ncmProgress->setWindowTitle(QStringLiteral("导入 NCM 音乐"));
+    ncmProgress->setWindowModality(Qt::WindowModal);
+    ncmProgress->setMinimumDuration(0);
+    connect(ncmProgress, &QProgressDialog::canceled, this, [this]() {
+        ncmConversionCancelled = true;
+        if (ncmProcess && ncmProcess->state() != QProcess::NotRunning)
+            ncmProcess->kill();
+    });
+    connect(ncmProcess, &QProcess::errorOccurred, this,
+            [this](QProcess::ProcessError error) {
+        if (error != QProcess::FailedToStart || !ncmProcess) return;
+        ncmProcess->deleteLater();
+        ncmProcess = nullptr;
+        if (ncmProgress) {
+            ncmProgress->close();
+            ncmProgress->deleteLater();
+            ncmProgress = nullptr;
+        }
+        if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
+        ncmOutputDir.clear();
+        QMessageBox::warning(this, QStringLiteral("无法启动转换工具"),
+                             QStringLiteral("无法启动 Java，请检查 Java 安装和 PATH 设置。"));
+    });
+    connect(ncmProcess,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &QQMusic::finishNcmConversion);
+    ncmProgress->show();
+    ncmProcess->start(javaPath, arguments);
+}
+
+void QQMusic::finishNcmConversion(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    QProcess *finishedProcess = ncmProcess;
+    if (!finishedProcess) return;
+    const QString errorOutput = QString::fromLocal8Bit(finishedProcess->readAllStandardError()).trimmed();
+    const QString standardOutput = QString::fromLocal8Bit(finishedProcess->readAllStandardOutput()).trimmed();
+    ncmProcess = nullptr;
+    finishedProcess->deleteLater();
+    if (ncmProgress) {
+        ncmProgress->close();
+        ncmProgress->deleteLater();
+        ncmProgress = nullptr;
+    }
+
+    if (ncmConversionCancelled) {
+        if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
+        ncmOutputDir.clear();
+        QMessageBox::information(this, QStringLiteral("已取消"), QStringLiteral("NCM 转换已取消。"));
+        return;
+    }
+    if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+        if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
+        ncmOutputDir.clear();
+        const QString diagnostic = errorOutput.isEmpty() ? standardOutput : errorOutput;
+        const QString detail = diagnostic.isEmpty() ? QString() : QStringLiteral("\n\n") + diagnostic.left(1800);
+        QMessageBox::warning(this, QStringLiteral("NCM 转换失败"),
+                             QStringLiteral("转换工具异常退出。请检查 NCM2MP3 工具和所选文件。%1").arg(detail));
+        return;
+    }
+
+    const QString convertedDir = QDir(ncmOutputDir).filePath(QStringLiteral("output"));
+    const QStringList audioFilters = QStringList()
+            << QStringLiteral("*.mp3") << QStringLiteral("*.flac") << QStringLiteral("*.wav")
+            << QStringLiteral("*.m4a") << QStringLiteral("*.aac") << QStringLiteral("*.ogg")
+            << QStringLiteral("*.wma");
+    QString musicRoot = QStandardPaths::writableLocation(QStandardPaths::MusicLocation);
+    if (musicRoot.isEmpty())
+        musicRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    if (musicRoot.isEmpty()) {
+        if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
+        ncmOutputDir.clear();
+        QMessageBox::warning(this, QStringLiteral("无法保存转换结果"),
+                             QStringLiteral("系统没有可用的音乐目录或应用数据目录。"));
+        return;
+    }
+    const QString libraryDir = QDir(musicRoot).filePath(QStringLiteral("简音播放器/转换音乐"));
+    QStringList importedPaths;
+    int copyFailures = 0;
+    if (!QDir().mkpath(libraryDir)) {
+        if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
+        ncmOutputDir.clear();
+        QMessageBox::warning(this, QStringLiteral("无法保存转换结果"),
+                             QStringLiteral("无法创建音乐目录：%1").arg(QDir::toNativeSeparators(libraryDir)));
+        return;
+    }
+    if (QDir(convertedDir).exists()) {
+        QDirIterator iterator(convertedDir, audioFilters, QDir::Files, QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            const QString sourcePath = iterator.next();
+            const QFileInfo sourceInfo(sourcePath);
+            const QString destinationPath = nextAvailableAudioPath(libraryDir, sourceInfo);
+            if (QFile::copy(sourcePath, destinationPath))
+                importedPaths.append(destinationPath);
+            else
+                ++copyFailures;
+        }
+    }
+    if (!ncmOutputDir.isEmpty()) QDir(ncmOutputDir).removeRecursively();
+    ncmOutputDir.clear();
+
+    if (importedPaths.isEmpty()) {
+        const QString diagnostic = errorOutput.isEmpty() ? standardOutput : errorOutput;
+        const QString detail = diagnostic.isEmpty() ? QString() : QStringLiteral("\n\n") + diagnostic.left(1800);
+        QMessageBox::warning(this, QStringLiteral("没有导入歌曲"),
+                             QStringLiteral("转换器没有生成可播放的音频文件，请确认所选 NCM 文件有效。%1").arg(detail));
+        return;
+    }
+
+    QList<QUrl> urls;
+    for (const QString &path : importedPaths) urls.append(QUrl::fromLocalFile(path));
+    musicList.addMusicsByUrl(urls);
+    musicList.writeToDB();
+    ui->stackedWidget->setCurrentIndex(4);
+    ui->localPage->reFresh(musicList);
+
+    QString summary = QStringLiteral("已转换并导入 %1 首歌曲。\n保存位置：%2")
+            .arg(importedPaths.size()).arg(QDir::toNativeSeparators(libraryDir));
+    const int conversionFailures = standardOutput.count(QStringLiteral("转换失败文件："));
+    if (conversionFailures > 0)
+        summary += QStringLiteral("\n转换器报告 %1 个文件转换失败。").arg(conversionFailures);
+    if (copyFailures > 0)
+        summary += QStringLiteral("\n有 %1 个文件复制失败。请检查磁盘空间或目标目录权限。").arg(copyFailures);
+    QMessageBox::information(this, QStringLiteral("NCM 导入完成"), summary);
 }
 
 void QQMusic::onLrcWordClicked()

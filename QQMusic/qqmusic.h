@@ -14,6 +14,9 @@
 #include <QStringList>
 #include <QMap>
 #include <QSet>
+#include <QProcess>
+#include <QTemporaryDir>
+#include <QProgressDialog>
 
 
 
@@ -61,6 +64,11 @@ private slots:
     void on_volume_clicked();
 
     void on_addLocal_clicked();
+    void addLocalAudioFiles();
+    void chooseNcmFiles();
+    void chooseNcmFolder();
+    void startNcmConversion(const QStringList &inputPaths);
+    void finishNcmConversion(int exitCode, QProcess::ExitStatus exitStatus);
 
     void onLrcWordClicked();
 
@@ -126,6 +134,11 @@ private:
     bool isDrag;
     QSet<QString> playbackFallbackAttempted;
     QMap<QString, QString> playbackFallbackPaths;
+    QProcess *ncmProcess;
+    QTemporaryDir ncmTempDir;
+    QProgressDialog *ncmProgress;
+    QString ncmOutputDir;
+    bool ncmConversionCancelled;
     void refreshCurrentCover(bool preferEmbeddedCover);
 };
 #endif // QQMUSIC_H
